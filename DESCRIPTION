@@ -1,4 +1,4 @@
-Package: duckdbviz
+Package: DBVisuals
 Title: Interactive Visualization of Large Datasets with DuckDB and JavaScript
 Version: 0.1.0
 Authors@R: 
