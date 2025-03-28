@@ -1,6 +1,6 @@
-# duckdbviz: High-Performance Interactive Visualization for Large Datasets in R
+# DBVisuals: High-Performance Interactive Visualization for Large Datasets in R
 
-`duckdbviz` is an R package that enables interactive visualization of large datasets using DuckDB and JavaScript. It provides a bidirectional communication system between R and the visualization, allowing for selection and filtering of data points with high performance.
+`DBVisuals` is an R package that enables interactive visualization of large datasets using DuckDB and JavaScript. It provides a bidirectional communication system between R and the visualization, allowing for selection and filtering of data points with high performance.
 
 ## Key Features
 
@@ -17,14 +17,14 @@
 ```r
 # Install from GitHub
 # install.packages("devtools")
-devtools::install_github("yourusername/duckdbviz")
+devtools::install_github("TiRizvanov/duckdbviz")
 ```
 
 Or install the package locally:
 
 ```r
 # Install from local directory
-install.packages("/path/to/duckdbviz", repos = NULL, type = "source")
+install.packages("/path/to/DBVisuals", repos = NULL, type = "source")
 ```
 
 ## Dependencies
@@ -44,7 +44,7 @@ The package requires the following R packages:
 ### Basic Usage with WebAssembly Mode
 
 ```r
-library(duckdbviz)
+library(DBVisuals)
 
 # Create a sample dataset
 set.seed(123)
@@ -65,7 +65,7 @@ duckdb_viz(data,
 ### High-Performance Native DuckDB Mode (Recommended for Large Datasets)
 
 ```r
-library(duckdbviz)
+library(DBVisuals)
 
 # Create a larger sample dataset
 set.seed(123)
@@ -86,13 +86,7 @@ duckdb_viz(large_data,
 
 ### Getting Selected Points
 
-```r
-# After selecting points in the visualization
-selected_points <- get_selection()
-
-# Analyze the selected points
-summary(selected_points)
-```
+- After selection point on the plot, they will get saved as Selection1.
 
 ### Cleaning Up Resources
 
