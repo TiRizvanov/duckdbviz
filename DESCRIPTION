@@ -1,0 +1,28 @@
+Package: duckdbviz
+Title: Interactive Visualization of Large Datasets with DuckDB and JavaScript
+Version: 0.1.0
+Authors@R: 
+    person("Your", "Name", email = "your.email@example.com", role = c("aut", "cre"))
+Description: Provides tools for interactive visualization of large datasets using 
+    DuckDB for efficient data processing and JavaScript for dynamic rendering. 
+    Enables bidirectional communication between R and JavaScript visualizations,
+    allowing for selection and filtering of data points.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+Imports: 
+    shiny,
+    htmltools,
+    jsonlite,
+    DBI,
+    duckdb,
+    rstudioapi,
+    arrow,
+    httpuv
+Suggests:
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown
+Config/testthat/edition: 3
+VignetteBuilder: knitr

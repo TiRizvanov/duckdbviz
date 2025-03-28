@@ -1,0 +1,126 @@
+---
+title: "Introduction to duckdbviz"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Introduction to duckdbviz}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+## Introduction
+
+The `duckdbviz` package provides tools for interactive visualization of large datasets using DuckDB for efficient data processing and JavaScript for dynamic rendering. This vignette introduces the basic usage of the package and demonstrates how to create interactive visualizations and work with selections.
+
+## Basic Usage
+
+### Creating a Visualization
+
+To create a visualization, you need a data frame with at least two numeric columns for the x and y axes. Optionally, you can provide a third column for coloring the points.
+
+```{r}
+library(duckdbviz)
+
+# Create a sample dataset
+set.seed(123)
+data <- data.frame(
+  x = rnorm(10000),
+  y = rnorm(10000),
+  group = sample(c(TRUE, FALSE), 10000, replace = TRUE)
+)
+
+# Create an interactive visualization
+duckdb_viz(data, x_col = "x", y_col = "y", color_col = "group")
+```
+
+The visualization will open in RStudio's Viewer pane or your default web browser. You can interact with the visualization by:
+
+- Zooming in and out with the mouse wheel
+- Panning by clicking and dragging
+- Hovering over points to see tooltips with details
+- Selecting points by enabling selection mode and drawing a rectangle
+
+### Working with Selections
+
+When you select points in the visualization, the selection is made available to R. You can access the selected points using the `get_current_selection()` function:
+
+```{r}
+# Get the current selection
+selected_points <- get_current_selection()
+
+# Examine the selection
+head(selected_points)
+summary(selected_points)
+```
+
+You can also save the selection to a variable in your environment:
+
+```{r}
+# Save the selection to a variable
+save_selection("my_selection")
+
+# Now you can use my_selection as a regular data frame
+plot(my_selection$x, my_selection$y)
+```
+
+## Working with Large Datasets
+
+One of the key features of `duckdbviz` is its ability to efficiently visualize large datasets. The package uses DuckDB for efficient data querying and dynamic sampling to maintain interactive performance even with millions of data points.
+
+```{r}
+# Create a large dataset
+set.seed(456)
+large_data <- data.frame(
+  x = rnorm(1000000),
+  y = rnorm(1000000),
+  group = sample(c(TRUE, FALSE), 1000000, replace = TRUE)
+)
+
+# Visualize the large dataset
+duckdb_viz(large_data, x_col = "x", y_col = "y", color_col = "group")
+```
+
+The visualization automatically adjusts the number of points rendered based on the current view and performance metrics to maintain a smooth interactive experience.
+
+## Customizing the Visualization
+
+You can customize the visualization by adjusting the width and height:
+
+```{r}
+duckdb_viz(
+  data = data,
+  x_col = "x",
+  y_col = "y",
+  color_col = "group",
+  width = 1200,
+  height = 800
+)
+```
+
+## Running in Standalone Mode
+
+If you prefer to run the visualization in a separate server, you can use the `run_server()` function:
+
+```{r}
+# Start the server
+run_server(port = 3000)
+
+# Open the visualization in RStudio's Viewer or browser
+open_viz("http://localhost:3000")
+
+# Stop the server when done
+stop_server()
+```
+
+## Conclusion
+
+The `duckdbviz` package provides a powerful way to interactively visualize and explore large datasets in R. By combining the efficiency of DuckDB with the interactivity of JavaScript, it enables smooth exploration of datasets that would be challenging to visualize with traditional R plotting functions.
+
+For more advanced usage and customization options, refer to the package documentation and the README file.

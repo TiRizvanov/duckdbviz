@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Dynamic Scatterplot with Native DuckDB & Incremental Sampling</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+    }
+    /* Status bar at the top */
+    #status {
+      padding: 10px;
+      background: #eee;
+      border-bottom: 1px solid #ccc;
+    }
+    /* Main container: subtract status bar's height. */
+    #container {
+      display: flex;
+      height: calc(100vh - 40px);
+    }
+    #plot-container {
+      position: relative;
+      flex: 1;
+      margin: 40px; /* Space for axes */
+    }
+    /* Canvas fills the plot area */
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    /* The SVG overlay for axes */
+    #axes {
+      position: absolute;
+      top: -40px;
+      left: -40px;
+      width: calc(100% + 80px); /* Extra space for axes */
+      height: calc(100% + 80px);
+      pointer-events: none; /* so mouse events pass through to canvas */
+    }
+    #panel {
+      width: 300px;
+      padding: 10px;
+      background: #f0f0f0;
+      border-left: 1px solid #ccc;
+      box-sizing: border-box;
+    }
+    .tooltip {
+      position: absolute;
+      background: rgba(255,255,255,0.9);
+      border: 1px solid #ccc;
+      padding: 8px 12px;
+      pointer-events: none;
+      font-size: 13px;
+      border-radius: 4px;
+      visibility: hidden;
+      box-shadow: 0px 0px 8px rgba(0,0,0,0.2);
+      z-index: 1000;
+      transition: opacity 0.2s;
+      opacity: 0;
+    }
+    .tooltip.show {
+      visibility: visible;
+      opacity: 1;
+    }
+    .slider-group {
+      margin-top: 10px;
+    }
+    .slider-group label {
+      display: block;
+      margin-bottom: 4px;
+    }
+    .slider-group input[type="range"],
+    .slider-group input[type="number"] {
+      width: 100%;
+      margin-bottom: 4px;
+    }
+    .button {
+      background-color: #4CAF50;
+      border: none;
+      color: white;
+      padding: 10px 15px;
+      text-align: center;
+      text-decoration: none;
+      display: inline-block;
+      font-size: 14px;
+      margin: 10px 0;
+      cursor: pointer;
+      border-radius: 4px;
+      transition: background-color 0.3s;
+    }
+    .button:hover {
+      background-color: #45a049;
+    }
+    .button.active {
+      background-color: #e91e63;
+    }
+    .button.active:hover {
+      background-color: #d81b60;
+    }
+  </style>
+  <!-- Load D3 and Apache Arrow as ES modules from CDNs -->
+  <script type="module">
+    import * as d3 from 'https://cdn.jsdelivr.net/npm/d3@7/+esm';
+    import * as arrow from 'https://cdn.jsdelivr.net/npm/apache-arrow@latest/+esm';
+
+    document.addEventListener('DOMContentLoaded', async () => {
+      /******************************************************
+       * Global Variables, Setup
+       ******************************************************/
+      // WebSocket connection to native DuckDB server
+      let socket;
+      let connected = false;
+      let dataBounds = null;
+      
+      // A Map of rendered points: key = row 'index', value = full row
+      let renderedPoints = new Map();
+      let currentResult = []; // Array version for tooltips
+      let pendingPoints = false; // Flag to indicate if we're waiting for points
+
+      const plotContainer = document.getElementById('plot-container');
+      const canvas = document.getElementById('scatterplot');
+      const context = canvas.getContext("2d");
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      
+      // Set actual canvas size with higher resolution for better rendering
+      canvas.width = width * 2;
+      canvas.height = height * 2;
+      context.scale(2, 2); // Scale context for high-DPI rendering
+
+      // The SVG overlay for axes
+      const svg = d3.select('#axes')
+        .attr('width', plotContainer.clientWidth + 80)
+        .attr('height', plotContainer.clientHeight + 80);
+
+      // Create margins for fixed axes
+      const margin = {top: 40, right: 40, bottom: 40, left: 40};
+      const innerWidth = width;
+      const innerHeight = height;
+
+      // Base D3 scales (default domain will be updated)
+      const xScale = d3.scaleLinear().domain([0, 200]).range([0, innerWidth]);
+      const yScale = d3.scaleLinear().domain([0, 200]).range([innerHeight, 0]);
+
+      // Color scale: true=blue, false=orange
+      const colorScale = d3.scaleOrdinal()
+        .domain([true, false])
+        .range(["#4285F4", "#FF9900"]);
+
+      // Dynamic threshold & state
+      let currentTransform = d3.zoomIdentity;
+      let pointThreshold = 25000; // initial - lower than wasm version since native is faster
+      let prevScale = currentTransform.k;
+      const lowerLimit = 6;
+      const upperLimit = 15;
+      let hasMoved = false;
+      let lastDrawTime = performance.now();
+      let lastFPS = "N/A";
+      let lastDrawDuration = 0;
+      let isRequestPending = false;
+
+      // DOM elements for panel
+      const fpsEl = document.getElementById('fps');
+      const threshEl = document.getElementById('thresh');
+      const dataSizeEl = document.getElementById('datasize');
+      const dataFilterSlider = document.getElementById('data-filter-slider');
+      const dataFilterNumber = document.getElementById('data-filter-number');
+      const tooltip = document.getElementById('tooltip');
+
+      // Just for display
+      let datasetSizeFilter = +dataFilterSlider.value;
+      dataFilterSlider.addEventListener('input', () => {
+        datasetSizeFilter = +dataFilterSlider.value;
+        dataFilterNumber.value = datasetSizeFilter;
+        dataSizeEl.textContent = `Data Points: ${datasetSizeFilter}`;
+        draw();
+      });
+      dataFilterNumber.addEventListener('input', () => {
+        datasetSizeFilter = +dataFilterNumber.value;
+        dataFilterSlider.value = datasetSizeFilter;
+        dataSizeEl.textContent = `Data Points: ${datasetSizeFilter}`;
+        draw();
+      });
+
+      // Selection variables
+      let selectionMode = false;
+      let isSelecting = false;
+      let selectionStart = null;
+      let selectionEnd = null;
+      let selectionCounter = 1;
+      // Store D3 zoom object to enable/disable it
+      let zoomBehavior = null;
+
+      // For R communication
+      window.RViz = {
+        // Store selection data to be retrieved by R
+        selectionData: null,
+        
+        // Function to notify R of a selection
+        notifySelectionToR: function(selection, selectionName) {
+          this.selectionData = selection;
+          // Signal to R that selection is available
+          if (window.Shiny) {
+            Shiny.setInputValue('viz_selection', {
+              timestamp: new Date().getTime(),
+              count: selection.length,
+              name: selectionName || `Selection${selectionCounter}`
+            });
+          }
+        },
+        
+        // Function for R to retrieve the selection data
+        getSelectionData: function() {
+          const data = this.selectionData;
+          this.selectionData = null; // Clear after retrieval
+          return data;
+        }
+      };
+
+      /******************************************************
+       * Helper function to decode base64 to arrayBuffer
+       ******************************************************/
+      function base64ToArrayBuffer(base64) {
+        const binaryString = atob(base64);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        return bytes.buffer;
+      }
+
+      /******************************************************
+       * WebSocket Connection to Native DuckDB
+       ******************************************************/
+      async function connectToNativeDuckDB() {
+        if (!window.websocketUrl) {
+          document.getElementById("status").textContent = "Error: Missing WebSocket URL";
+          return;
+        }
+        
+        try {
+          document.getElementById("status").textContent = "Connecting to native DuckDB server...";
+          
+          socket = new WebSocket(window.websocketUrl);
+          window.socket = socket; // Expose socket globally for debugging
+          
+          socket.onopen = function() {
+            document.getElementById("status").textContent = "Connected to native DuckDB server";
+            connected = true;
+            
+            // Get metadata about the data
+            socket.send(JSON.stringify({
+              type: "metadata"
+            }));
+            
+            console.log("WebSocket connection established");
+          };
+          
+          socket.onmessage = async function(event) {
+            try {
+              // All data is now sent as text (JSON)
+              const data = JSON.parse(event.data);
+              
+              if (data.type === "arrow_data") {
+                // This is base64-encoded Arrow data
+                isRequestPending = false;
+                pendingPoints = false;
+                
+                // Decode base64 string to ArrayBuffer
+                const arrowBuffer = base64ToArrayBuffer(data.data);
+                
+                // Process Arrow data
+                const table = arrow.tableFromIPC(new Uint8Array(arrowBuffer));
+                
+                // Convert Arrow table to JavaScript objects
+                const rows = table.toArray().map(row => {
+                  // Convert arrow table rows to plain objects
+                  return Object.fromEntries(
+                    Object.keys(row).map(key => [key, row[key]])
+                  );
+                });
+                
+                console.log("Received data points:", rows.length);
+                
+                // Add new points to rendered points
+                rows.forEach(d => renderedPoints.set(d.index, d));
+                
+                // Update visualization
+                currentResult = Array.from(renderedPoints.values());
+                redraw();
+              } else if (data.type === "selection_saved") {
+                // R has confirmed saving the selection
+                document.getElementById("status").textContent = 
+                  `Selection saved as ${data.name} with ${data.count} points.`;
+                selectionCounter = data.nextCounter;
+              } else if (data.min_x !== undefined) {
+                // It's metadata about the data
+                dataBounds = data;
+                
+                console.log("Data bounds:", dataBounds);
+                
+                // Update scales with actual data bounds
+                xScale.domain([dataBounds.min_x, dataBounds.max_x]);
+                yScale.domain([dataBounds.min_y, dataBounds.max_y]);
+                
+                // Update display
+                dataSizeEl.textContent = `Total Records: ${dataBounds.total_rows}`;
+                
+                // Initial draw
+                draw();
+              } else if (data.type === "error") {
+                console.error("Server error:", data.message);
+                document.getElementById("status").textContent = "Error: " + data.message;
+              } else {
+                console.log("Received other data:", data);
+              }
+            } catch (error) {
+              console.error("Error processing message:", error);
+              document.getElementById("status").textContent = "Error processing data: " + error.message;
+            }
+          };
+          
+          socket.onerror = function(error) {
+            console.error("WebSocket error:", error);
+            document.getElementById("status").textContent = "WebSocket error";
+            connected = false;
+          };
+          
+          socket.onclose = function() {
+            console.log("WebSocket connection closed");
+            document.getElementById("status").textContent = "Disconnected from DuckDB server";
+            connected = false;
+          };
+        } catch (error) {
+          console.error("Connection error:", error);
+          document.getElementById("status").textContent = "Failed to connect to DuckDB server: " + error.message;
+        }
+      }
+      
+      await connectToNativeDuckDB();
+
+      /******************************************************
+       * Query Methods
+       ******************************************************/
+      async function queryPoints(x0, x1, y0, y1, limit) {
+        if (!connected || isRequestPending) return;
+        
+        isRequestPending = true;
+        pendingPoints = true;
+        
+        console.log("Querying points:", { x0, x1, y0, y1, limit });
+        
+        // Exclude points already in cache
+        const cachedIds = Array.from(renderedPoints.keys());
+        let notInClause = "";
+        if (cachedIds.length > 0 && cachedIds.length < 5000) {  // practical limit for query length
+          notInClause = `AND index NOT IN (${cachedIds.join(',')})`;
+        }
+        
+        const query = `
+          SELECT *
+          FROM tissue_positions
+          WHERE array_col BETWEEN ${x0} AND ${x1}
+            AND array_row BETWEEN ${y0} AND ${y1}
+            ${notInClause}
+          ORDER BY random()
+          LIMIT ${limit}
+        `;
+        
+        // Send query request to server
+        socket.send(JSON.stringify({
+          type: "query",
+          query: query
+        }));
+      }
+
+      /******************************************************
+       * Drawing Functions
+       ******************************************************/
+      async function draw() {
+        if (!connected) return;
+        
+        const drawStart = performance.now();
+
+        // We create scaled versions so we can transform data coords -> pixel coords
+        const newXScale = currentTransform.rescaleX(xScale);
+        const newYScale = currentTransform.rescaleY(yScale);
+
+        const x0 = newXScale.invert(0);
+        const x1 = newXScale.invert(width);
+        const y0 = newYScale.invert(height);
+        const y1 = newYScale.invert(0);
+
+        // If user zoomed out (scale < prevScale), mark that we need new points
+        // but don't clear existing points until new ones arrive (for smooth transition)
+        if (currentTransform.k < prevScale) {
+          // Only clear if we're zooming out significantly
+          if (currentTransform.k < prevScale * 0.8) {
+            // Instead of clearing immediately, we'll set a flag and clear when new points arrive
+            pendingPoints = true;
+          }
+        }
+
+        // If we have fewer than threshold or just zoomed out, fetch more
+        const needed = pointThreshold - renderedPoints.size;
+        if (needed > 0 || pendingPoints) {
+          console.log("Need more points:", needed);
+          // Query more points from server
+          queryPoints(x0, x1, y0, y1, Math.max(needed, pointThreshold / 2));
+        } else if (renderedPoints.size > pointThreshold * 1.2) {
+          // If we have more than threshold, remove some
+          const surplus = renderedPoints.size - pointThreshold;
+          const keys = Array.from(renderedPoints.keys());
+          for (let i = 0; i < surplus; i++) {
+            renderedPoints.delete(keys[i]);
+          }
+          currentResult = Array.from(renderedPoints.values());
+        }
+
+        redraw();
+        
+        // Measure FPS
+        const nowTime = performance.now();
+        const delta = nowTime - lastDrawTime;
+        const fps = delta > 0 ? (1000 / delta) : 0;
+        lastDrawTime = nowTime;
+        lastDrawDuration = (performance.now() - drawStart).toFixed(1);
+        lastFPS = fps.toFixed(1);
+        fpsEl.textContent = `FPS: ${lastFPS} (draw: ${lastDrawDuration} ms)`;
+        threshEl.textContent = `Threshold: ${pointThreshold} (Current: ${renderedPoints.size})`;
+
+        // Dynamic threshold adjustment if the user is panning or zooming
+        if (hasMoved) {
+          // If FPS is high, maybe increase threshold
+          if (fps > upperLimit && currentResult.length >= pointThreshold && currentResult.length < 2 * pointThreshold) {
+            let divisionCoefficient = 1 - 0.5 * (upperLimit / fps);
+            if (divisionCoefficient > 0.95) divisionCoefficient = 0.95;
+            pointThreshold = Math.min(200000, Math.floor(pointThreshold / divisionCoefficient));
+          }
+          // If FPS is low, reduce threshold
+          else if (fps < lowerLimit) {
+            let multiplicationCoefficient = Math.max(fps / lowerLimit, 0.9);
+            pointThreshold = Math.max(1000, Math.floor(pointThreshold * multiplicationCoefficient));
+          }
+        }
+
+        // Update prevScale
+        prevScale = currentTransform.k;
+      }
+      
+      function redraw() {
+        // We create scaled versions so we can transform data coords -> pixel coords
+        const newXScale = currentTransform.rescaleX(xScale);
+        const newYScale = currentTransform.rescaleY(yScale);
+        
+        // Clear canvas
+        context.clearRect(0, 0, width, height);
+        
+        // Draw from renderedPoints
+        renderedPoints.forEach(d => {
+          const x = newXScale(d.array_col);
+          const y = newYScale(d.array_row);
+          context.beginPath();
+          context.arc(x, y, 4, 0, 2 * Math.PI);
+          context.fillStyle = colorScale(d.in_tissue);
+          context.globalAlpha = 0.8;
+          context.fill();
+          context.lineWidth = 0.5;
+          context.strokeStyle = "black";
+          context.stroke();
+        });
+
+        // Draw selection rectangle if active
+        if (isSelecting && selectionStart && selectionEnd) {
+          const x = Math.min(selectionStart.x, selectionEnd.x);
+          const y = Math.min(selectionStart.y, selectionEnd.y);
+          const w = Math.abs(selectionEnd.x - selectionStart.x);
+          const h = Math.abs(selectionEnd.y - selectionStart.y);
+
+          context.beginPath();
+          context.rect(x, y, w, h);
+          context.fillStyle = 'rgba(65, 105, 225, 0.2)';
+          context.fill();
+          context.strokeStyle = 'rgb(65, 105, 225)';
+          context.lineWidth = 2;
+          context.stroke();
+        }
+
+        // Draw fixed axes
+        updateAxes(newXScale, newYScale);
+      }
+      
+      // Update the axes with fixed positioning outside the plot
+      function updateAxes(newXScale, newYScale) {
+        // Update / clear the axes overlay
+        const svg = d3.select('#axes');
+        svg.selectAll('*').remove();
+        
+        // Create a group for the axes at the right position
+        const axesGroup = svg.append('g')
+          .attr('transform', `translate(${margin.left}, ${margin.top})`);
+        
+        // Add a border around the plot area
+        axesGroup.append('rect')
+          .attr('width', innerWidth)
+          .attr('height', innerHeight)
+          .attr('fill', 'none')
+          .attr('stroke', '#ccc')
+          .attr('stroke-width', 1);
+        
+        // Draw x-axis at bottom
+        axesGroup.append('g')
+          .attr('class', 'x-axis')
+          .attr('transform', `translate(0, ${innerHeight})`)
+          .call(d3.axisBottom(newXScale).ticks(10))
+          .append('text')
+          .attr('x', innerWidth / 2)
+          .attr('y', 35)
+          .attr('fill', 'black')
+          .attr('text-anchor', 'middle')
+          .text('X Value');
+
+        // Draw y-axis at left
+        axesGroup.append('g')
+          .attr('class', 'y-axis')
+          .call(d3.axisLeft(newYScale).ticks(10))
+          .append('text')
+          .attr('transform', 'rotate(-90)')
+          .attr('x', -innerHeight / 2)
+          .attr('y', -35)
+          .attr('fill', 'black')
+          .attr('text-anchor', 'middle')
+          .text('Y Value');
+      }
+
+      /******************************************************
+       * Zoom Behavior
+       ******************************************************/
+      // Create zoom behavior but don't apply it yet
+      zoomBehavior = d3.zoom()
+        .scaleExtent([0.5, 20])
+        .on('zoom', (event) => {
+          currentTransform = event.transform;
+          hasMoved = true;
+          draw();
+        });
+      
+      // Apply zoom behavior initially
+      enableZoom();
+      
+      // Function to enable zooming
+      function enableZoom() {
+        console.log("Enabling zoom behavior");
+        d3.select(canvas).call(zoomBehavior);
+      }
+      
+      // Function to disable zooming
+      function disableZoom() {
+        console.log("Disabling zoom behavior");
+        d3.select(canvas).on('.zoom', null);
+      }
+
+      /******************************************************
+       * Selection Functionality
+       ******************************************************/
+      // Add selection toggle button
+      const selectionButton = document.createElement('button');
+      selectionButton.textContent = 'Enable Selection';
+      selectionButton.className = 'button';
+      selectionButton.style.margin = '10px 0';
+      selectionButton.style.display = 'block';
+      document.getElementById('panel').appendChild(selectionButton);
+      
+      // Toggle selection mode
+      selectionButton.addEventListener('click', function() {
+        selectionMode = !selectionMode;
+        selectionButton.textContent = selectionMode ? 'Disable Selection' : 'Enable Selection';
+        selectionButton.className = selectionMode ? 'button active' : 'button';
+        canvas.style.cursor = selectionMode ? 'crosshair' : 'default';
+        
+        // Toggle between zoom and selection behavior
+        if (selectionMode) {
+          disableZoom();
+          
+          // Add direct event listeners for selection on the canvas
+          canvas.onmousedown = handleMouseDown;
+          canvas.onmousemove = handleMouseMove;
+          canvas.onmouseup = handleMouseUp;
+          canvas.onmouseleave = handleMouseLeave;
+        } else {
+          // Reset selection state
+          isSelecting = false;
+          selectionStart = null;
+          selectionEnd = null;
+          
+          // Remove direct event handlers
+          canvas.onmousedown = null;
+          canvas.onmousemove = handleTooltip; // Keep tooltip handler
+          canvas.onmouseup = null;
+          canvas.onmouseleave = null;
+          
+          // Re-enable zoom
+          enableZoom();
+          redraw();
+        }
+        
+        document.getElementById("status").textContent = selectionMode ? 
+          "Selection mode enabled - Click and drag to select points" : 
+          "Connected to native DuckDB server";
+      });
+
+      // Handle mouse down - start selection
+      function handleMouseDown(e) {
+        console.log('Selection started');
+        
+        // Get mouse position relative to canvas
+        const rect = canvas.getBoundingClientRect();
+        selectionStart = {
+          x: e.clientX - rect.left,
+          y: e.clientY - rect.top
+        };
+        selectionEnd = { ...selectionStart };
+        isSelecting = true;
+        
+        // Hide tooltip during selection
+        tooltip.classList.remove('show');
+        
+        e.preventDefault();
+        redraw();
+      }
+
+      // Handle mouse move - update selection or show tooltip
+      function handleMouseMove(e) {
+        // Get mouse position relative to canvas
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        
+        if (isSelecting) {
+          console.log('Selection updating', mouseX, mouseY);
+          selectionEnd = {
+            x: mouseX,
+            y: mouseY
+          };
+          redraw();
+        }
+      }
+
+      // Separate handler for tooltips
+      function handleTooltip(e) {
+        if (selectionMode) return;
+        
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        
+        // We create scaled versions so we can transform data coords -> pixel coords
+        const newXScale = currentTransform.rescaleX(xScale);
+        const newYScale = currentTransform.rescaleY(yScale);
+        
+        // Find point under cursor
+        let found = null;
+        let minDistance = Infinity;
+        
+        currentResult.forEach(d => {
+          const x = newXScale(d.array_col);
+          const y = newYScale(d.array_row);
+          const distance = Math.hypot(x - mouseX, y - mouseY);
+          if (distance < minDistance && distance < 10) {
+            minDistance = distance;
+            found = d;
+          }
+        });
+        
+        if (found) {
+          tooltip.style.left = (e.pageX + 15) + 'px';
+          tooltip.style.top = (e.pageY - 15) + 'px';
+          tooltip.innerHTML = `
+            <strong>Index:</strong> ${found.index}<br>
+            <strong>X:</strong> ${found.array_col.toFixed(2)}<br>
+            <strong>Y:</strong> ${found.array_row.toFixed(2)}<br>
+            <strong>Group:</strong> ${found.in_tissue ? 'True' : 'False'}
+          `;
+          tooltip.classList.add('show');
+        } else {
+          tooltip.classList.remove('show');
+        }
+      }
+
+      // Handle mouse up - complete selection
+      function handleMouseUp(e) {
+        if (!isSelecting) return;
+        
+        console.log('Selection completed');
+        
+        // Get mouse position relative to canvas
+        const rect = canvas.getBoundingClientRect();
+        selectionEnd = {
+          x: e.clientX - rect.left,
+          y: e.clientY - rect.top
+        };
+        
+        // We create scaled versions so we can transform data coords -> pixel coords
+        const newXScale = currentTransform.rescaleX(xScale);
+        const newYScale = currentTransform.rescaleY(yScale);
+        
+        // Convert screen coordinates to data coordinates
+        const x0 = Math.min(selectionStart.x, selectionEnd.x);
+        const x1 = Math.max(selectionStart.x, selectionEnd.x);
+        const y0 = Math.min(selectionStart.y, selectionEnd.y);
+        const y1 = Math.max(selectionStart.y, selectionEnd.y);
+        
+        const dataX0 = newXScale.invert(x0);
+        const dataX1 = newXScale.invert(x1);
+        const dataY0 = newYScale.invert(y0);
+        const dataY1 = newYScale.invert(y1);
+        
+        // Find points inside rectangle (in data coordinates)
+        // Note: Y-axis is inverted in canvas vs data coordinates
+        const selectedPoints = currentResult.filter(d => {
+          return d.array_col >= dataX0 && d.array_col <= dataX1 && 
+                 d.array_row >= dataY1 && d.array_row <= dataY0;
+        });
+        
+        // If we have points, save them
+        if (selectedPoints.length > 0) {
+          const selectionName = `Selection${selectionCounter}`;
+          
+          // Prepare simplified data structure for sending to R
+          const selectionData = selectedPoints.map(point => {
+            return {
+              index: point.index,
+              array_col: point.array_col,
+              array_row: point.array_row,
+              in_tissue: point.in_tissue
+            };
+          });
+          
+          // Highlight selected points
+          redraw();
+          context.save();
+          selectedPoints.forEach(d => {
+            const x = newXScale(d.array_col);
+            const y = newYScale(d.array_row);
+            context.beginPath();
+            context.arc(x, y, 6, 0, 2 * Math.PI);
+            context.fillStyle = "rgba(255, 255, 0, 0.5)";
+            context.fill();
+            context.lineWidth = 2;
+            context.strokeStyle = "red";
+            context.stroke();
+          });
+          context.restore();
+          
+          // Send to R
+          socket.send(JSON.stringify({
+            type: "save_selection",
+            data: selectionData,
+            name: selectionName
+          }));
+          
+          document.getElementById("status").textContent = 
+            `Selected ${selectedPoints.length} points. Saving as ${selectionName}...`;
+        } else {
+          document.getElementById("status").textContent = "No points found in selection area.";
+        }
+        
+        // Keep selection visible briefly
+        setTimeout(() => {
+          isSelecting = false;
+          selectionStart = null;
+          selectionEnd = null;
+          redraw();
+        }, 1000);
+      }
+
+      function handleMouseLeave(e) {
+        tooltip.classList.remove('show');
+        
+        // If selection in progress, complete it
+        if (isSelecting) {
+          const rect = canvas.getBoundingClientRect();
+          selectionEnd = {
+            x: e.clientX - rect.left,
+            y: e.clientY - rect.top
+          };
+          
+          // Adjust for boundaries
+          if (selectionEnd.x < 0) selectionEnd.x = 0;
+          if (selectionEnd.x > width) selectionEnd.x = width;
+          if (selectionEnd.y < 0) selectionEnd.y = 0;
+          if (selectionEnd.y > height) selectionEnd.y = height;
+          
+          handleMouseUp(e);
+        }
+      }
+
+      // Escape key to cancel selection
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && isSelecting) {
+          isSelecting = false;
+          selectionStart = null;
+          selectionEnd = null;
+          redraw();
+          document.getElementById("status").textContent = "Selection canceled";
+        }
+      });
+
+      // Apply tooltip handler for normal mode
+      canvas.addEventListener('mousemove', handleTooltip);
+
+      // Clean up WebSocket connection before window unloads
+      window.addEventListener('beforeunload', () => {
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.close();
+        }
+      });
+      
+      // Handle window resize
+      window.addEventListener('resize', () => {
+        const newWidth = plotContainer.clientWidth;
+        const newHeight = plotContainer.clientHeight;
+        
+        // Resize main canvas
+        canvas.width = newWidth * 2;
+        canvas.height = newHeight * 2;
+        context.scale(2, 2);
+        
+        // Resize SVG
+        svg.attr('width', newWidth + 80)
+           .attr('height', newHeight + 80);
+           
+        // Update scales
+        xScale.range([0, newWidth]);
+        yScale.range([newHeight, 0]);
+        
+        // Redraw
+        draw();
+      });
+    });
+  </script>
+</head>
+<body>
+  <div id="status">Initializing...</div>
+  <div id="container">
+    <div id="plot-container">
+      <canvas id="scatterplot"></canvas>
+      <!-- The SVG overlay for axes, sized in code -->
+      <svg id="axes"></svg>
+    </div>
+    <div id="panel">
+      <h3>Performance Metrics</h3>
+      <div id="fps">FPS: N/A</div>
+      <div id="thresh">Threshold: 25000</div>
+      <div id="datasize">Total Records: Calculating...</div>
+      <hr>
+      <p>Using Native DuckDB Server for improved performance</p>
+      <div class="slider-group">
+        <label for="data-filter-slider">Viewport Sample Size:</label>
+        <input id="data-filter-slider" type="range" min="1000" max="200000" value="25000">
+        <input id="data-filter-number" type="number" min="1000" max="200000" value="25000">
+      </div>
+    </div>
+  </div>
+  <div class="tooltip" id="tooltip"></div>
+</body>
+</html>
